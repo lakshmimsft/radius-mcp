@@ -1,0 +1,352 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"strings"
+	"time"
+)
+
+// MCP Protocol structures
+type MCPRequest struct {
+	Version     string                 `json:"version"`
+	MessageType string                 `json:"messageType"`
+	Message     map[string]interface{} `json:"message"`
+}
+
+type MCPResponse struct {
+	Version     string                 `json:"version"`
+	MessageType string                 `json:"messageType"`
+	Message     map[string]interface{} `json:"message"`
+}
+
+type ToolDefinition struct {
+	Name        string                 `json:"name"`
+	Description string                 `json:"description"`
+	Parameters  map[string]interface{} `json:"parameters"`
+}
+
+type ToolCallResponse struct {
+	ToolCallID string                 `json:"toolCallId"`
+	Results    map[string]interface{} `json:"results"`
+}
+
+// RadiusTool represents a CLI command wrapped as a tool
+type RadiusTool struct {
+	Name        string
+	Description string
+	Command     string
+	Args        []string
+	Parameters  map[string]interface{}
+}
+
+// Available tools
+var radiusTools = []RadiusTool{
+	{
+		Name:        "radius_version",
+		Description: "Get the Radius CLI version",
+		Command:     "rad",
+		Args:        []string{"version"},
+		Parameters:  map[string]interface{}{},
+	},
+	{
+		Name:        "radius_list_applications",
+		Description: "List all Radius applications",
+		Command:     "rad",
+		Args:        []string{"app", "list"},
+		Parameters: map[string]interface{}{
+			"properties": map[string]interface{}{
+				"namespace": map[string]interface{}{
+					"type":        "string",
+					"description": "Kubernetes namespace",
+				},
+			},
+		},
+	},
+	{
+		Name:        "radius_show_application",
+		Description: "Get details of a Radius application",
+		Command:     "rad",
+		Args:        []string{"app", "show"},
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"name": map[string]interface{}{
+					"type":        "string",
+					"description": "Application name",
+				},
+				"namespace": map[string]interface{}{
+					"type":        "string",
+					"description": "Kubernetes namespace",
+				},
+			},
+			"required": []string{"name"},
+		},
+	},
+	{
+		Name:        "radius_deploy_application",
+		Description: "Deploy a Radius application",
+		Command:     "rad",
+		Args:        []string{"deploy"},
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"file": map[string]interface{}{
+					"type":        "string",
+					"description": "Path to the Bicep file",
+				},
+				"name": map[string]interface{}{
+					"type":        "string",
+					"description": "Application name",
+				},
+				"namespace": map[string]interface{}{
+					"type":        "string",
+					"description": "Kubernetes namespace",
+				},
+			},
+			"required": []string{"file"},
+		},
+	},
+}
+
+func main() {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8085"
+	}
+
+	http.HandleFunc("/mcp", handleMCPRequest)
+
+	log.Printf("Starting Radius MCP server on port %s...", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
+}
+
+func handleMCPRequest(w http.ResponseWriter, r *http.Request) {
+	// Set CORS headers for all requests
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+	// Handle OPTIONS requests (preflight)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Accept GET requests for SSE
+	if r.Method == http.MethodGet {
+		// Set headers for SSE
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		// Keep connection open and send events
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+			return
+		}
+
+		// Send initial ping to keep connection open
+		fmt.Fprintf(w, "event: ping\ndata: {}\n\n")
+		flusher.Flush()
+
+		// Create initialization response
+		initResponse := handleInitializeRequest()
+		initJSON, err := json.Marshal(initResponse)
+		if err != nil {
+			log.Printf("Error marshaling init response: %v", err)
+		} else {
+			// For SSE, we need to send the message properly formatted
+			fmt.Fprintf(w, "event: message\ndata: %s\n\n", string(initJSON))
+			flusher.Flush()
+			log.Printf("Sent SSE initialization message with tools")
+		}
+
+		// Keep the connection open with periodic pings
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-r.Context().Done():
+				// Client disconnected
+				log.Printf("SSE client disconnected")
+				return
+			case <-ticker.C:
+				// Send periodic pings
+				fmt.Fprintf(w, "event: ping\ndata: {}\n\n")
+				flusher.Flush()
+			}
+		}
+	} else if r.Method == http.MethodPost {
+		// Handle POST requests for regular API calls
+		var mcpRequest MCPRequest
+		if err := json.NewDecoder(r.Body).Decode(&mcpRequest); err != nil {
+			http.Error(w, fmt.Sprintf("Error decoding request: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		// Set the content type for the response
+		w.Header().Set("Content-Type", "application/json")
+
+		var response MCPResponse
+
+		switch mcpRequest.MessageType {
+		case "initializeRequest":
+			log.Printf("Received initialize request via POST")
+			response = handleInitializeRequest()
+		case "toolCallRequest":
+			log.Printf("Received toolCallRequest via POST")
+			response = handleToolCallRequest(mcpRequest)
+		default:
+			http.Error(w, fmt.Sprintf("Unsupported message type: %s", mcpRequest.MessageType), http.StatusBadRequest)
+			return
+		}
+
+		// Encode and send the response
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			log.Printf("Error encoding response: %v", err)
+		}
+	} else {
+		// Other methods not allowed
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func handleInitializeRequest() MCPResponse {
+	tools := []map[string]interface{}{}
+
+	for _, tool := range radiusTools {
+		toolDef := map[string]interface{}{
+			"name":        tool.Name,
+			"description": tool.Description,
+			"parameters":  tool.Parameters,
+		}
+		tools = append(tools, toolDef)
+	}
+
+	return MCPResponse{
+		Version:     "0.1",
+		MessageType: "initializeResponse",
+		Message: map[string]interface{}{
+			"tools": tools,
+		},
+	}
+}
+
+func handleToolCallRequest(request MCPRequest) MCPResponse {
+	message := request.Message
+	toolCalls := message["toolCalls"].([]interface{})
+
+	var toolCallResponses []map[string]interface{}
+
+	for _, tc := range toolCalls {
+		toolCall := tc.(map[string]interface{})
+		toolCallID := toolCall["toolCallId"].(string)
+		toolName := toolCall["name"].(string)
+		toolParams := toolCall["parameters"].(map[string]interface{})
+
+		result, err := executeRadiusTool(toolName, toolParams)
+
+		response := map[string]interface{}{
+			"toolCallId": toolCallID,
+		}
+
+		if err != nil {
+			response["error"] = err.Error()
+		} else {
+			response["results"] = result
+		}
+
+		toolCallResponses = append(toolCallResponses, response)
+	}
+
+	return MCPResponse{
+		Version:     "0.1",
+		MessageType: "toolCallResponse",
+		Message: map[string]interface{}{
+			"toolCallResponses": toolCallResponses,
+		},
+	}
+}
+
+func executeRadiusTool(toolName string, params map[string]interface{}) (map[string]interface{}, error) {
+	var selectedTool *RadiusTool
+
+	for _, tool := range radiusTools {
+		if tool.Name == toolName {
+			selectedTool = &tool
+			break
+		}
+	}
+
+	if selectedTool == nil {
+		return nil, fmt.Errorf("tool not found: %s", toolName)
+	}
+
+	args := make([]string, len(selectedTool.Args))
+	copy(args, selectedTool.Args)
+
+	// Add parameters to the command
+	switch toolName {
+	case "radius_list_applications":
+		if group, ok := params["group"].(string); ok && group != "" {
+			args = append(args, "-g", group)
+		}
+	case "radius_show_application":
+		application, ok := params["application"].(string)
+		if !ok || application == "" {
+			return nil, fmt.Errorf("application name is required")
+		}
+		args = append(args, "-a", application)
+
+		if group, ok := params["group"].(string); ok && group != "" {
+			args = append(args, "-g", group)
+		}
+	case "radius_deploy_application":
+		file, ok := params["file"].(string)
+		if !ok || file == "" {
+			return nil, fmt.Errorf("bicep file path is required")
+		}
+		args = append(args, file)
+
+		if environment, ok := params["environment"].(string); ok && environment != "" {
+			args = append(args, "-e", environment)
+		}
+
+		if group, ok := params["group"].(string); ok && group != "" {
+			args = append(args, "-g", group)
+		}
+	}
+
+	// Execute the command
+	cmd := exec.Command(selectedTool.Command, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("command execution failed: %v - %s", err, string(output))
+	}
+
+	// Process output
+	result := map[string]interface{}{
+		"output": string(output),
+	}
+
+	// For certain commands, we might want to parse the output into structured data
+	if toolName == "radius_list_applications" || toolName == "radius_show_application" {
+		// Attempt to parse as JSON if the output appears to be JSON
+		trimmedOutput := strings.TrimSpace(string(output))
+		if strings.HasPrefix(trimmedOutput, "{") || strings.HasPrefix(trimmedOutput, "[") {
+			var parsedData interface{}
+			if err := json.Unmarshal([]byte(trimmedOutput), &parsedData); err == nil {
+				result["data"] = parsedData
+			}
+		}
+	}
+
+	return result, nil
+}

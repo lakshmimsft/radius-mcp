@@ -1,0 +1,440 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"strings"
+	"time"
+)
+
+// MCP Protocol structures
+type MCPRequest struct {
+	Version     string                 `json:"version"`
+	MessageType string                 `json:"messageType"`
+	Message     map[string]interface{} `json:"message"`
+}
+
+type MCPResponse struct {
+	Version     string                 `json:"version"`
+	MessageType string                 `json:"messageType"`
+	Message     map[string]interface{} `json:"message"`
+}
+
+// RadiusTool represents a CLI command wrapped as a tool
+type RadiusTool struct {
+	Name        string
+	Description string
+	Command     string
+	Args        []string
+	Parameters  map[string]interface{}
+}
+
+// Available tools
+var radiusTools = []RadiusTool{
+	{
+		Name:        "radius_version",
+		Description: "Get the Radius CLI version",
+		Command:     "rad",
+		Args:        []string{"version"},
+		Parameters: map[string]interface{}{
+			"type":       "object",
+			"properties": map[string]interface{}{},
+		},
+	},
+	{
+		Name:        "radius_list_applications",
+		Description: "List all Radius applications",
+		Command:     "rad",
+		Args:        []string{"app", "list"},
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"namespace": map[string]interface{}{
+					"type":        "string",
+					"description": "Kubernetes namespace",
+				},
+			},
+		},
+	},
+	{
+		Name:        "radius_show_application",
+		Description: "Get details of a Radius application",
+		Command:     "rad",
+		Args:        []string{"app", "show"},
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"name": map[string]interface{}{
+					"type":        "string",
+					"description": "Application name",
+				},
+				"namespace": map[string]interface{}{
+					"type":        "string",
+					"description": "Kubernetes namespace",
+				},
+			},
+			"required": []string{"name"},
+		},
+	},
+	{
+		Name:        "radius_deploy_application",
+		Description: "Deploy a Radius application",
+		Command:     "rad",
+		Args:        []string{"deploy"},
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"file": map[string]interface{}{
+					"type":        "string",
+					"description": "Path to the Bicep file",
+				},
+				"name": map[string]interface{}{
+					"type":        "string",
+					"description": "Application name",
+				},
+				"namespace": map[string]interface{}{
+					"type":        "string",
+					"description": "Kubernetes namespace",
+				},
+			},
+			"required": []string{"file"},
+		},
+	},
+}
+
+func main() {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8085"
+	}
+
+	http.HandleFunc("/mcp", handleMCPRequest)
+	http.HandleFunc("/mcp2", handleMCPRequest)
+
+	log.Printf("Starting Radius MCP server on port %s (endpoints: /mcp and /mcp2)...", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
+}
+
+func handleMCPRequest(w http.ResponseWriter, r *http.Request) {
+	// Set CORS headers for all requests
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	// Log request details
+	log.Printf("Request from: %s %s %s", r.RemoteAddr, r.Method, r.URL.Path)
+
+	// Handle OPTIONS requests (preflight)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Accept GET requests for SSE
+	if r.Method == http.MethodGet {
+		log.Printf("Handling SSE connection request from %s", r.RemoteAddr)
+
+		// Set headers for SSE
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("Cache-Control", "no-cache, no-transform")
+		w.Header().Set("X-Accel-Buffering", "no")
+
+		// Keep connection open and send events
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+			log.Printf("Error: Streaming not supported")
+			return
+		}
+
+		// Send initial ping event
+		fmt.Fprintf(w, "event: ping\ndata: {}\n\n")
+		flusher.Flush()
+		log.Printf("Sent initial ping event")
+
+		time.Sleep(200 * time.Millisecond)
+
+		// Send initialization response
+		tools := getToolDefinitions()
+		initMessage := map[string]interface{}{
+			"protocolVersion": "0.1",
+			"tools":           tools,
+		}
+
+		initResponse := MCPResponse{
+			Version:     "0.1",
+			MessageType: "initializeResponse",
+			Message:     initMessage,
+		}
+
+		initJSON, err := json.Marshal(initResponse)
+		if err != nil {
+			log.Printf("Error marshaling init response: %v", err)
+		} else {
+			log.Printf("Sending initialization response with %d tools", len(tools))
+
+			// Format for SSE - must be "event: message" followed by "data: {json}"
+			fmt.Fprintf(w, "event: message\ndata: %s\n\n", string(initJSON))
+			flusher.Flush()
+			log.Printf("Sent SSE initialization message")
+		}
+
+		// Sleep a bit to ensure messages are processed in order
+		time.Sleep(200 * time.Millisecond)
+
+		// Tools registered notification
+		toolsRegisteredMsg := MCPResponse{
+			Version:     "0.1",
+			MessageType: "toolsRegisteredNotification",
+			Message: map[string]interface{}{
+				"status": "success",
+			},
+		}
+
+		toolsJSON, err := json.Marshal(toolsRegisteredMsg)
+		if err != nil {
+			log.Printf("Error marshaling tools registered notification: %v", err)
+		} else {
+			fmt.Fprintf(w, "event: message\ndata: %s\n\n", string(toolsJSON))
+			flusher.Flush()
+			log.Printf("Sent SSE tools registered notification")
+		}
+
+		// Keep the connection open with periodic pings
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+
+		// Use request context for client disconnection
+		ctx := r.Context()
+
+		for {
+			select {
+			case <-ctx.Done():
+				log.Printf("SSE client disconnected from %s", r.RemoteAddr)
+				return
+			case <-ticker.C:
+				// Send periodic pings
+				fmt.Fprintf(w, "event: ping\ndata: {}\n\n")
+				flusher.Flush()
+				log.Printf("Sent ping event")
+			}
+		}
+	} else if r.Method == http.MethodPost {
+		// Handle POST requests for regular API calls
+		log.Printf("Handling POST request from %s", r.RemoteAddr)
+
+		var mcpRequest MCPRequest
+		if err := json.NewDecoder(r.Body).Decode(&mcpRequest); err != nil {
+			log.Printf("Error decoding request: %v", err)
+			http.Error(w, fmt.Sprintf("Error decoding request: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		log.Printf("Received %s request", mcpRequest.MessageType)
+
+		// Set the content type for the response
+		w.Header().Set("Content-Type", "application/json")
+
+		var response MCPResponse
+
+		switch mcpRequest.MessageType {
+		case "initializeRequest":
+			tools := getToolDefinitions()
+			response = MCPResponse{
+				Version:     "0.1",
+				MessageType: "initializeResponse",
+				Message: map[string]interface{}{
+					"protocolVersion": "0.1",
+					"tools":           tools,
+				},
+			}
+			log.Printf("Sending initialization response with %d tools", len(tools))
+		case "toolCallRequest":
+			response = handleToolCallRequest(mcpRequest)
+		default:
+			log.Printf("Unsupported message type: %s", mcpRequest.MessageType)
+			http.Error(w, fmt.Sprintf("Unsupported message type: %s", mcpRequest.MessageType), http.StatusBadRequest)
+			return
+		}
+
+		// Encode and send the response
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			log.Printf("Error encoding response: %v", err)
+			http.Error(w, fmt.Sprintf("Error encoding response: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		log.Printf("Successfully sent %s response", response.MessageType)
+	} else {
+		// Other methods not allowed
+		log.Printf("Method not allowed: %s", r.Method)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// Get tool definitions formatted according to MCP protocol
+func getToolDefinitions() []map[string]interface{} {
+	tools := []map[string]interface{}{}
+
+	for _, tool := range radiusTools {
+		toolDef := map[string]interface{}{
+			"name":        tool.Name,
+			"description": tool.Description,
+		}
+
+		if tool.Parameters != nil {
+			toolDef["parameters"] = tool.Parameters
+		} else {
+			toolDef["parameters"] = map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			}
+		}
+
+		tools = append(tools, toolDef)
+	}
+
+	return tools
+}
+
+func handleToolCallRequest(request MCPRequest) MCPResponse {
+	message := request.Message
+	toolCalls, ok := message["toolCalls"].([]interface{})
+	if !ok {
+		log.Printf("Invalid toolCalls format in request")
+		return MCPResponse{
+			Version:     "0.1",
+			MessageType: "toolCallResponse",
+			Message: map[string]interface{}{
+				"error": "Invalid toolCalls format in request",
+			},
+		}
+	}
+
+	var toolCallResponses []map[string]interface{}
+
+	for _, tc := range toolCalls {
+		toolCall, ok := tc.(map[string]interface{})
+		if !ok {
+			log.Printf("Invalid toolCall format in request")
+			continue
+		}
+
+		toolCallID := toolCall["toolCallId"].(string)
+		toolName := toolCall["name"].(string)
+		toolParams, ok := toolCall["parameters"].(map[string]interface{})
+		if !ok {
+			toolParams = map[string]interface{}{}
+		}
+
+		log.Printf("Processing tool call: %s (%s)", toolName, toolCallID)
+		result, err := executeRadiusTool(toolName, toolParams)
+
+		response := map[string]interface{}{
+			"toolCallId": toolCallID,
+		}
+
+		if err != nil {
+			log.Printf("Tool execution error: %v", err)
+			response["error"] = err.Error()
+		} else {
+			response["results"] = result
+			log.Printf("Tool execution successful")
+		}
+
+		toolCallResponses = append(toolCallResponses, response)
+	}
+
+	return MCPResponse{
+		Version:     "0.1",
+		MessageType: "toolCallResponse",
+		Message: map[string]interface{}{
+			"toolCallResponses": toolCallResponses,
+		},
+	}
+}
+
+func executeRadiusTool(toolName string, params map[string]interface{}) (map[string]interface{}, error) {
+	var selectedTool *RadiusTool
+
+	for _, tool := range radiusTools {
+		if tool.Name == toolName {
+			selectedTool = &tool
+			break
+		}
+	}
+
+	if selectedTool == nil {
+		return nil, fmt.Errorf("tool not found: %s", toolName)
+	}
+
+	args := make([]string, len(selectedTool.Args))
+	copy(args, selectedTool.Args)
+
+	// Add parameters to the command
+	switch toolName {
+	case "radius_list_applications":
+		if namespace, ok := params["namespace"].(string); ok && namespace != "" {
+			args = append(args, "-n", namespace)
+		}
+	case "radius_show_application":
+		name, ok := params["name"].(string)
+		if !ok || name == "" {
+			return nil, fmt.Errorf("application name is required")
+		}
+		args = append(args, name)
+
+		if namespace, ok := params["namespace"].(string); ok && namespace != "" {
+			args = append(args, "-n", namespace)
+		}
+	case "radius_deploy_application":
+		file, ok := params["file"].(string)
+		if !ok || file == "" {
+			return nil, fmt.Errorf("bicep file path is required")
+		}
+		args = append(args, file)
+
+		if name, ok := params["name"].(string); ok && name != "" {
+			args = append(args, "-n", name)
+		}
+
+		if namespace, ok := params["namespace"].(string); ok && namespace != "" {
+			args = append(args, "--namespace", namespace)
+		}
+	}
+
+	log.Printf("Executing command: %s %s", selectedTool.Command, strings.Join(args, " "))
+
+	// Execute the command
+	cmd := exec.Command(selectedTool.Command, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("command execution failed: %v - %s", err, string(output))
+	}
+
+	// Process output
+	result := map[string]interface{}{
+		"output": string(output),
+	}
+
+	// For certain commands, we might want to parse the output into structured data
+	if toolName == "radius_list_applications" || toolName == "radius_show_application" {
+		// Attempt to parse as JSON if the output appears to be JSON
+		trimmedOutput := strings.TrimSpace(string(output))
+		if strings.HasPrefix(trimmedOutput, "{") || strings.HasPrefix(trimmedOutput, "[") {
+			var parsedData interface{}
+			if err := json.Unmarshal([]byte(trimmedOutput), &parsedData); err == nil {
+				result["data"] = parsedData
+			}
+		}
+	}
+
+	return result, nil
+}
